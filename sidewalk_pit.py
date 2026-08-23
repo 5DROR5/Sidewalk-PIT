@@ -1426,6 +1426,34 @@ def smooth_path(points, target_spacing, max_turn_deg=None):
     return result
 
 
+def resample_section_tangents(points, widths, target_spacing, sec, max_turn_deg=None):
+    """Carry explicit cross-section directions through a resample.
+
+    A fan pivots about the inner corner, so its sections are radial. Only when the
+    two ribbons are the same width is that the same thing as perpendicular-to-path,
+    which is why dropping these used to look harmless. Returns a list matching the
+    resampled points, with None wherever the input had none.
+    """
+    if not sec or len(sec) != len(points) or len(points) < 3 or target_spacing <= 0:
+        return None
+    padded_p = ([points[0] * 2.0 - points[1]] + list(points)
+                + [points[-1] * 2.0 - points[-2]])
+    out = [sec[0]]
+    for i in range(1, len(padded_p) - 2):
+        p0, p1, p2, p3 = padded_p[i - 1], padded_p[i], padded_p[i + 1], padded_p[i + 2]
+        if (p2 - p1).length < 1e-6:
+            continue
+        ta, tb = sec[i - 1], sec[i]
+        kn = cr_knots(p0, p1, p2, p3)
+        for t in _segment_t_values(p0, p1, p2, p3, target_spacing, max_turn_deg, kn):
+            if ta is None or tb is None:
+                out.append(tb if t > 0.999 else None)
+                continue
+            v = ta * (1.0 - t) + tb * t
+            out.append(v.normalized() if v.length > 1e-9 else tb)
+    return out
+
+
 def smooth_path_with_widths(points, widths, target_spacing, depths=None, max_turn_deg=None):
     if len(points) < 3 or target_spacing <= 0:
         if depths is None:
@@ -3118,6 +3146,122 @@ def _try_fan(A, wA, B, wB, cap_a, cap_b):
     return ta, tb, 1.0, frame
 
 
+FAN_MIN_TURN_DEG = 15.0
+FAN_MAX_TURN_DEG = 165.0
+FAN_RADIUS_SCALE = 1.0
+FAN_MAX_RADIUS = 6.0
+FAN_ARC_MAX_STEP_DEG = 6.0
+
+
+def _line_cross(p, d, q, e):
+    den = d.x * (-e.y) + d.y * e.x
+    if abs(den) < 1e-9:
+        return None
+    rx, ry = q.x - p.x, q.y - p.y
+    t = (rx * (-e.y) + ry * e.x) / den
+    return Vector((p.x + d.x * t, p.y + d.y * t, 0.0))
+
+
+def solve_fan_junction(pa, da, hwa, pb, db, hwb, z=0.0):
+    """Two ribbons meeting at a junction. `da` leaves it, `db` arrives at it.
+
+    Their four edge lines always meet in a parallelogram, whatever the widths or
+    the angle. Only two of its corners matter: the inner one, where both ribbons
+    are cut off, and the outer one, which gets a fillet. The other two lie on the
+    ribbons' own edges and are not corners of the outline at all.
+
+    Returns None when the two are too close to parallel or to doubled back, since
+    the parallelogram then runs away to infinity.
+    """
+    da = Vector((da.x, da.y, 0.0)).normalized()
+    db = Vector((db.x, db.y, 0.0)).normalized()
+    turn = math.degrees(math.acos(max(-1.0, min(1.0, da.dot(db)))))
+    if turn < FAN_MIN_TURN_DEG or turn > FAN_MAX_TURN_DEG:
+        return None
+    theta = math.radians(turn)
+    sin_t = math.sin(theta)
+    if sin_t < 1e-6:
+        return None
+
+    na = Vector((-da.y, da.x, 0.0))
+    nb = Vector((-db.y, db.x, 0.0))
+    cross = {}
+    for sa in (1.0, -1.0):
+        for sb in (1.0, -1.0):
+            hit = _line_cross(pa + na * (hwa * sa), da, pb + nb * (hwb * sb), db)
+            if hit is None:
+                return None
+            cross[(sa, sb)] = hit
+    centre = _line_cross(pa, da, pb, db)
+    if centre is None:
+        return None
+    inner_key = min(cross, key=lambda k: (cross[k] - centre).length)
+    outer_key = (-inner_key[0], -inner_key[1])
+    inner, outer = cross[inner_key], cross[outer_key]
+
+    # how far each ribbon has to be cut back so it ends on the line through `inner`
+    trim_a = (inner - pa).x * da.x + (inner - pa).y * da.y
+    trim_b = (inner - pb).x * db.x + (inner - pb).y * db.y
+
+    corner_a = cross[(outer_key[0], inner_key[1])]
+    corner_b = cross[(inner_key[0], outer_key[1])]
+    side_a = (outer - corner_a).length
+    side_b = (outer - corner_b).length
+    if side_a < 1e-6 or side_b < 1e-6:
+        return None
+
+    # unit vectors pointing from each side corner into the outer corner
+    ea = (outer - corner_a).normalized()
+    eb = (outer - corner_b).normalized()
+    # the interior angle at the outer corner is between the edges leaving it
+    phi = math.acos(max(-1.0, min(1.0, ea.dot(eb))))
+    half = phi / 2.0
+    if half < 1e-4 or half > math.pi / 2.0 - 1e-4:
+        return None
+
+    # the hub sits a perpendicular radius off both outer edges, so it stays inside
+    # the parallelogram only while the radius is under its narrower dimension; and
+    # the tangent points must not run past the side corners
+    r_fit = min(2.0 * hwa, 2.0 * hwb)
+    r_fit = min(r_fit, min(side_a, side_b) * math.tan(half))
+    radius = max(0.0, min(r_fit * FAN_RADIUS_SCALE, FAN_MAX_RADIUS, r_fit))
+    tan_d = radius / math.tan(half)
+
+    ta = outer - ea * tan_d
+    tb = outer - eb * tan_d
+    bis = (ea + eb)
+    if bis.length < 1e-9:
+        return None
+    hub = outer - bis.normalized() * (radius / math.sin(half))
+
+    a0 = math.atan2(ta.y - hub.y, ta.x - hub.x)
+    a1 = math.atan2(tb.y - hub.y, tb.x - hub.x)
+    sweep = a1 - a0
+    while sweep > math.pi:
+        sweep -= 2.0 * math.pi
+    while sweep < -math.pi:
+        sweep += 2.0 * math.pi
+    steps = max(2, int(math.ceil(abs(math.degrees(sweep)) / FAN_ARC_MAX_STEP_DEG)))
+    arc = [Vector((hub.x + math.cos(a0 + sweep * i / steps) * radius,
+                   hub.y + math.sin(a0 + sweep * i / steps) * radius, z))
+           for i in range(steps + 1)]
+
+    ring = [Vector((inner.x, inner.y, z)), Vector((corner_a.x, corner_a.y, z))]
+    ring += arc
+    ring.append(Vector((corner_b.x, corner_b.y, z)))
+    seen = [ring[0]]
+    for q in ring[1:]:
+        if (q - seen[-1]).length > 1e-6:
+            seen.append(q)
+
+    return {"inner": inner, "outer": outer, "turn": turn,
+            "trim_a": trim_a, "trim_b": trim_b,
+            "radius": radius, "hub": hub, "tangent_a": ta, "tangent_b": tb,
+            "arc": arc, "ring": seen,
+            "side_a": side_a, "side_b": side_b, "corner_a": corner_a,
+            "corner_b": corner_b, "interior_deg": math.degrees(phi)}
+
+
 def _solve_junction(pa, ea, pb, eb):
     A, wA = _oriented(pa, ea)
     B, wB = _oriented(pb, eb)
@@ -3830,7 +3974,7 @@ def _guarded(fn):
 
 
 @_guarded
-def check_offsets(name, points, tangents, widths, miter, closed=False):
+def check_offsets(name, points, tangents, widths, miter, closed=False, skip=None):
     """The swept edge must sit exactly half-width from the centreline segment it spans.
     Catches a missing or wrong miter compensation, which silently narrows the ribbon."""
     if not VALIDATE or len(points) < 2:
@@ -3839,6 +3983,8 @@ def check_offsets(name, points, tangents, widths, miter, closed=False):
     rng = range(len(points)) if closed else range(len(points) - 1)
     for i in rng:
         j = (i + 1) % len(points)
+        if skip and (skip[i] or skip[j]):
+            continue
         a, b = points[i], points[j]
         seg = math.hypot(b.x - a.x, b.y - a.y)
         if seg < 1e-9:
@@ -3903,7 +4049,7 @@ def check_vertical(name, points):
 
 
 @_guarded
-def check_fold(name, points, tangents, offsets, closed=False):
+def check_fold(name, points, tangents, offsets, closed=False, skip=None):
     """Both offset edges must advance forwards across every span, or the surface
     crosses itself and the classifier reports bowties."""
     if not VALIDATE or len(points) < 2:
@@ -3911,6 +4057,8 @@ def check_fold(name, points, tangents, offsets, closed=False):
     rng = range(len(points)) if closed else range(len(points) - 1)
     for i in rng:
         j = (i + 1) % len(points)
+        if skip and (skip[i] or skip[j]):
+            continue
         if not _offset_advances(points, tangents, offsets, i, j):
             _flag(name, "fold", "an offset edge runs backwards - the surface folds", points[i])
             return
@@ -3947,12 +4095,18 @@ def report_validation():
         print(f"     ... and {len(VALIDATION) - 20} more")
 
 
-def miter_scales(points, tangents, closed=False):
+def miter_scales(points, tangents, closed=False, radial=None):
+    """A miter widens the section so a corner keeps its width. It assumes the
+    section is perpendicular to the path. A fan section is radial from the pivot
+    by design, so the same formula reads the angle as a corner and blows the width
+    up - leave those at 1.0."""
     n = len(points)
     out = [1.0] * n
     if not MITER_COMPENSATION or n < 3:
         return out
     for i in range(n):
+        if radial and i < len(radial) and radial[i]:
+            continue
         j = (i + 1) % n if closed else min(i + 1, n - 1)
         if j == i:
             continue
@@ -3971,7 +4125,7 @@ def miter_scales(points, tangents, closed=False):
 
 def build_sidewalk_side(bm, uv_layer, points, tangents, dists, widths, heights, center_offset, mirror,
                          extra_z_offset=0.0, terrain_sampler=None, closed=False, bevel_outer_edges=False,
-                         hidden_layer=None, caps=None, up_layer=None, name_hint=""):
+                         hidden_layer=None, caps=None, up_layer=None, name_hint="", radial=None):
     def cap_of(i):
         return caps[i] if (caps and i < len(caps)) else None
 
@@ -4003,7 +4157,7 @@ def build_sidewalk_side(bm, uv_layer, points, tangents, dists, widths, heights, 
                          int(math.ceil(walk_worst / WALK_SPLIT_TARGET_FOLD_DEG)))
             walk_fracs = walk_split_fracs(walk_n, *spans[worst_at])
 
-    miter = miter_scales(points, tangents, closed)
+    miter = miter_scales(points, tangents, closed, radial)
 
     cross_sections = []
     for i, (p, t, w, h) in enumerate(zip(points, tangents, widths, heights)):
@@ -4034,9 +4188,10 @@ def build_sidewalk_side(bm, uv_layer, points, tangents, dists, widths, heights, 
             return f"{role}_chamfer"
         return role
 
-    check_offsets(name_hint or "?", points, tangents, widths, miter, closed)
+    check_offsets(name_hint or "?", points, tangents, widths, miter, closed, radial)
     check_fold(name_hint or "?", points, tangents,
-               [widths[i] / 2.0 * miter[i] + abs(center_offset) for i in range(n_pts)], closed)
+               [widths[i] / 2.0 * miter[i] + abs(center_offset) for i in range(n_pts)],
+               closed, radial)
     check_vertical(name_hint or "?", points)
     check_top_crease(name_hint or "?", points, tangents, widths, walk_n, closed)
 
@@ -4355,7 +4510,7 @@ def finalize_bm(bm, mesh, name, hidden_layer=None, validate=True,
 
 def build_mesh_for_side(points, tangents, dists, widths, heights, center_offset, mirror, name,
                          extra_z_offset=0.0, terrain_sampler=None, closed=False, bevel_outer_edges=False,
-                         skip_hidden=False, count_stats=False, caps=None):
+                         skip_hidden=False, count_stats=False, caps=None, radial=None):
     mesh = bpy.data.meshes.new(name)
     bm = bmesh.new()
     uv_layer = bm.loops.layers.uv.verify()
@@ -4365,7 +4520,7 @@ def build_mesh_for_side(points, tangents, dists, widths, heights, center_offset,
     FACE_REFS[0] = [] if ACTIVE_UP[0] is not None else None
     build_sidewalk_side(bm, uv_layer, points, tangents, dists, widths, heights, center_offset, mirror,
                          extra_z_offset, terrain_sampler, closed, bevel_outer_edges, hidden_layer, caps,
-                         up_layer, name)
+                         up_layer, name, radial)
     refs = FACE_REFS[0]
     FACE_REFS[0] = None
 
@@ -4613,12 +4768,12 @@ def build_island_mesh(ring, name, height, extra_z_offset=0.0, terrain_sampler=No
 
 def build_colmesh_for_side(points, tangents, dists, widths, heights, center_offset, mirror, name,
                             extra_z_offset=0.0, terrain_sampler=None, closed=False, bevel_outer_edges=False,
-                            caps=None):
+                            caps=None, radial=None):
     mesh = bpy.data.meshes.new(name)
     bm = bmesh.new()
 
-    miter = miter_scales(points, tangents, closed)
-    check_offsets(f"{name} (collision)", points, tangents, widths, miter, closed)
+    miter = miter_scales(points, tangents, closed, radial)
+    check_offsets(f"{name} (collision)", points, tangents, widths, miter, closed, radial)
 
     cs_list = []
     for i, (p, t, w, h) in enumerate(zip(points, tangents, widths, heights)):
@@ -5139,7 +5294,18 @@ def main():
 
         elif road["source"] == "decalroad_exact":
             if ZEBRA_SMOOTH_CORNERS and not road.get("merged"):
+                sec_in = road.get("section_tangents")
+                sec_out = resample_section_tangents(points, trimmed_widths,
+                                                    ZEBRA_SMOOTH_SEGMENT_LENGTH, sec_in)
                 points, widths_z = smooth_path_with_widths(points, trimmed_widths, ZEBRA_SMOOTH_SEGMENT_LENGTH)
+                if sec_out is not None and len(sec_out) == len(points):
+                    road = dict(road)
+                    road["section_tangents"] = sec_out
+                elif sec_in:
+                    road = dict(road)
+                    road["section_tangents"] = None
+                    print(f"  [fan] warning: '{road.get('name') or r_idx}' - {len(sec_in)} explicit "
+                          f"fan sections did not survive resampling, corner will use path normals")
             else:
                 widths_z = trimmed_widths
             road, points, widths_z, _ = apply_simplify(road, points, widths_z, None)
@@ -5237,10 +5403,21 @@ def main():
             if len(v_pts) != len(points):
                 print(f"    rounded ends: +{len(v_pts) - len(points)} rings")
 
+            sec_now = road.get("section_tangents")
+            radial_mask = None
+            if sec_now and len(sec_now) == len(points):
+                keyed = {(round(p.x, 4), round(p.y, 4))
+                         for p, v in zip(points, sec_now) if v is not None}
+                if keyed:
+                    radial_mask = [(round(q.x, 4), round(q.y, 4)) in keyed for q in v_pts]
+                    if not any(radial_mask):
+                        radial_mask = None
+
             mesh_data = build_mesh_for_side(
                 v_pts, v_tan, v_dist, v_w, v_h, center_offset, mirror, mesh_name,
                 road_extra_z, road_terrain, road_closed, road_bevel,
-                skip_hidden=OPTIMIZE_HIDDEN_FACES, count_stats=True, caps=v_caps
+                skip_hidden=OPTIMIZE_HIDDEN_FACES, count_stats=True, caps=v_caps,
+                radial=radial_mask
             )
             mesh_data.materials.append(walk_mats[0])
             mesh_data.materials.append(curb_material)
@@ -5255,13 +5432,14 @@ def main():
             if SIMPLE_COLMESH:
                 colmesh_data = build_colmesh_for_side(
                     v_pts, v_tan, v_dist, v_w, v_h, center_offset, mirror,
-                    col_name, road_extra_z, road_terrain, road_closed, road_bevel, caps=v_caps
+                    col_name, road_extra_z, road_terrain, road_closed, road_bevel,
+                    caps=v_caps, radial=radial_mask
                 )
             else:
                 colmesh_data = build_mesh_for_side(
                     v_pts, v_tan, v_dist, v_w, v_h, center_offset, mirror,
                     col_name, road_extra_z, road_terrain, road_closed, road_bevel,
-                    skip_hidden=False, count_stats=False, caps=v_caps
+                    skip_hidden=False, count_stats=False, caps=v_caps, radial=radial_mask
                 )
                 if not COLMESH_UV:
                     while colmesh_data.uv_layers:
