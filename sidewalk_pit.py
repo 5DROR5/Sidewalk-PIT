@@ -1348,12 +1348,22 @@ def get_terrain_sampler():
 CR_ALPHA = 0.5
 
 
+CR_MIN_KNOT_SPAN = 1e-9
+
+CR_DUP_KNOT_EPS = 1e-6
+CR_DUP_KNOT_FRAC = 0.05
+
+
 def cr_knots(p0, p1, p2, p3):
     if CR_ALPHA <= 0.0:
         return None
+    lens = [(b - a).length for a, b in ((p0, p1), (p1, p2), (p2, p3))]
+    ref = max(lens)
+    floor = (max(CR_MIN_KNOT_SPAN, ref * CR_DUP_KNOT_FRAC) if ref > 0.0
+             else CR_MIN_KNOT_SPAN)
     t = [0.0]
-    for a, b in ((p0, p1), (p1, p2), (p2, p3)):
-        t.append(t[-1] + max(1e-9, (b - a).length) ** CR_ALPHA)
+    for L in lens:
+        t.append(t[-1] + (L if L > CR_DUP_KNOT_EPS else floor) ** CR_ALPHA)
     return tuple(t)
 
 
@@ -1427,13 +1437,6 @@ def smooth_path(points, target_spacing, max_turn_deg=None):
 
 
 def resample_section_tangents(points, widths, target_spacing, sec, max_turn_deg=None):
-    """Carry explicit cross-section directions through a resample.
-
-    A fan pivots about the inner corner, so its sections are radial. Only when the
-    two ribbons are the same width is that the same thing as perpendicular-to-path,
-    which is why dropping these used to look harmless. Returns a list matching the
-    resampled points, with None wherever the input had none.
-    """
     if not sec or len(sec) != len(points) or len(points) < 3 or target_spacing <= 0:
         return None
     padded_p = ([points[0] * 2.0 - points[1]] + list(points)
@@ -1668,11 +1671,94 @@ def _dedupe(points, widths, depths):
     return op, ow, od
 
 
+def _densify(points, widths, depths, spacing, max_turn_deg):
+    if depths is not None:
+        dn, dw, _dd = smooth_path_with_widths(points, widths, spacing, depths=depths,
+                                              max_turn_deg=max_turn_deg)
+    else:
+        dn, dw = smooth_path_with_widths(points, widths, spacing, max_turn_deg=max_turn_deg)
+    dn, dw, _x = _dedupe(dn, dw, None)
+    return dn, dw
+
+
+def mitre_run(points, widths, i):
+    n = len(points)
+    if i <= 0 or i >= n - 1:
+        return 0.0
+    a = points[i] - points[i - 1]
+    b = points[i + 1] - points[i]
+    la, lb = a.length, b.length
+    if la < 1e-9 or lb < 1e-9:
+        return 0.0
+    cos_t = max(-1.0, min(1.0, (a.x * b.x + a.y * b.y) / (la * lb)))
+    half = min(math.acos(cos_t) / 2.0, math.radians(MESHROAD_SHARP_MAX_HALF_DEG))
+    hw = (widths[i] if widths and i < len(widths) else 0.0) / 2.0
+    return hw * math.tan(half)
+
+
+def mitre_fits(points, widths, i):
+    n = len(points)
+    if i <= 0 or i >= n - 1:
+        return False
+    need = mitre_run(points, widths, i)
+    if need <= 0.0:
+        return True
+    legs = ((i - 1, (points[i] - points[i - 1]).length),
+            (i + 1, (points[i + 1] - points[i]).length))
+    for j, leg in legs:
+        other = mitre_run(points, widths, j) if 0 < j < n - 1 else 0.0
+        if need + other > leg * MESHROAD_SHARP_FIT_HEADROOM:
+            return False
+    return True
+
+
+def strip_mitre_tail(points, widths, heights, mitres, frac=None):
+    f = MESHROAD_MITRE_STRIP_FRAC if frac is None else frac
+    n = len(points)
+    if n < 3 or not mitres or f <= 0.0:
+        return points, widths, heights, 0
+    protect = set()
+    for mp, _run in mitres:
+        best, best_d = None, float("inf")
+        for i, p in enumerate(points):
+            d = math.hypot(p.x - mp.x, p.y - mp.y)
+            if d < best_d:
+                best, best_d = i, d
+        if best is not None:
+            protect.add(best)
+    keep = []
+    for i, p in enumerate(points):
+        if i in protect or i == 0 or i == n - 1:
+            keep.append(i)
+            continue
+        drop = False
+        for mp, run in mitres:
+            r = run * f
+            if r > 1e-6 and math.hypot(p.x - mp.x, p.y - mp.y) < r:
+                drop = True
+                break
+        if not drop:
+            keep.append(i)
+    if len(keep) < 3 or len(keep) == n:
+        return points, widths, heights, 0
+    return ([points[i] for i in keep],
+            [widths[i] for i in keep],
+            ([heights[i] for i in keep] if heights else heights),
+            n - len(keep))
+
+
 def sharpen_unroundable_corners(points, widths, depths, spacing, max_turn_deg, ratio):
     n = len(points)
     sharp = [False] * n
+    blocked = [False] * n
     if n < 3:
-        return points, widths, depths, 0
+        return points, widths, depths, 0, []
+    if MESHROAD_SHARP_MITRE_FIT:
+        for i in range(1, n - 1):
+            if not mitre_fits(points, widths, i):
+                blocked[i] = True
+    base_dense = len(_densify(points, widths, depths, spacing, max_turn_deg)[0])
+    cap_dense = base_dense * MESHROAD_SHARP_MAX_GROWTH
     for _ in range(n):
         cp, cw, cd = _dup_sharp(points, widths, depths, sharp)
         if cd is not None:
@@ -1687,8 +1773,8 @@ def sharpen_unroundable_corners(points, widths, depths, spacing, max_turn_deg, r
             if hw <= 1e-6:
                 continue
             near = min((abs((dn[k] - points[m]).x) + abs((dn[k] - points[m]).y), m)
-                       for m in range(1, n - 1) if not sharp[m])[1] \
-                if any(not sharp[m] for m in range(1, n - 1)) else None
+                       for m in range(1, n - 1) if not sharp[m] and not blocked[m])[1] \
+                if any(not sharp[m] and not blocked[m] for m in range(1, n - 1)) else None
             if near is None:
                 continue
             if (dn[k] - points[near]).length > spacing * 3.0:
@@ -1699,11 +1785,25 @@ def sharpen_unroundable_corners(points, widths, depths, spacing, max_turn_deg, r
         if at is None or worst >= ratio:
             break
         sharp[at] = True
+        if base_dense > 0 and len(dn) > cap_dense:
+            print(f"  [corner] warning: corner sharpening ran away - {base_dense} samples "
+                  f"became {len(dn)}. Abandoning it, the road is rounded as before")
+            return points, widths, depths, 0, []
+    n_blocked = sum(1 for v in blocked if v)
+    if n_blocked:
+        print(f"  [corner] {n_blocked} corner(s) left rounded - the mitre would have "
+              f"eaten more leg than there is between them")
     count = sum(1 for v in sharp if v)
     if not count:
-        return points, widths, depths, 0
+        return points, widths, depths, 0, []
     cp, cw, cd = _dup_sharp(points, widths, depths, sharp)
-    return cp, cw, cd, count
+    grown = len(_densify(cp, cw, cd, spacing, max_turn_deg)[0])
+    if base_dense > 0 and grown > cap_dense:
+        print(f"  [corner] warning: corner sharpening blew the sample count from "
+              f"{base_dense} to {grown} - abandoning it, the road is rounded as before")
+        return points, widths, depths, 0, []
+    return cp, cw, cd, count, [(points[i].copy(), mitre_run(points, widths, i))
+                               for i in range(n) if sharp[i]]
 
 
 def relax_for_swept_path(points, widths, depths, spacing, max_turn_deg=None):
@@ -1731,6 +1831,17 @@ def relax_for_swept_path(points, widths, depths, spacing, max_turn_deg=None):
 
 MESHROAD_SHARP_CORNERS = True
 MESHROAD_SHARP_RATIO = 1.0
+MESHROAD_SHARP_MAX_GROWTH = 1.5
+
+MESHROAD_FORCE_MITRE_RINGS = True
+MESHROAD_MITRE_MATCH_DIST = 0.5
+
+MESHROAD_MITRE_STRIP = True
+MESHROAD_MITRE_STRIP_FRAC = 0.5
+
+MESHROAD_SHARP_MITRE_FIT = True
+MESHROAD_SHARP_FIT_HEADROOM = 0.95
+MESHROAD_SHARP_MAX_HALF_DEG = 85.0
 MITER_COMPENSATION = True
 MITER_LIMIT = 3.0
 
@@ -1738,6 +1849,16 @@ MESHROAD_WIDTH_CLAMP = True
 MESHROAD_WIDTH_LIPSCHITZ = 0.35
 MESHROAD_MIN_HALF_WIDTH = 0.35
 MESHROAD_WIDTH_CLAMP_HEADROOM = 1.10
+
+MESHROAD_ASYM_JOIN = True
+ACTIVE_ASYM_JOIN = [False]
+
+MESHROAD_CLAMP_INNER_ONLY = True
+ACTIVE_INNER_SCALE = [None]
+
+MESHROAD_CLAMP_SPAN = False
+MESHROAD_CLAMP_SPAN_FRAC = 0.5
+MESHROAD_CLAMP_SPAN_MIN = 0.25
 
 
 def _width_clamp_ratio():
@@ -1754,9 +1875,28 @@ def clamp_widths_to_radius(points, widths, closed=False, ratio=None,
     ratio = _width_clamp_ratio() if ratio is None else ratio
     slope = MESHROAD_WIDTH_LIPSCHITZ if slope is None else slope
     floor_hw = MESHROAD_MIN_HALF_WIDTH if floor_hw is None else floor_hw
+    seg = [0.0] * n
+    for i in range(1, n):
+        d = points[i] - points[i - 1]
+        seg[i] = math.hypot(d.x, d.y)
+    acc = [0.0] * n
+    for i in range(1, n):
+        acc[i] = acc[i - 1] + seg[i]
+    span_mode = bool(MESHROAD_CLAMP_SPAN and not closed and n >= 3)
     hw = []
     for i in range(n):
-        if closed:
+        if span_mode:
+            span = max(MESHROAD_CLAMP_SPAN_MIN, widths[i] / 2.0 * MESHROAD_CLAMP_SPAN_FRAC)
+            lo = i
+            while lo > 0 and acc[i] - acc[lo] < span:
+                lo -= 1
+            hi = i
+            while hi < n - 1 and acc[hi] - acc[i] < span:
+                hi += 1
+            if lo == i or hi == i:
+                lo, hi = max(0, i - 1), min(n - 1, i + 1)
+            a, b, c = points[lo], points[i], points[hi]
+        elif closed:
             a, b, c = points[i - 1], points[i], points[(i + 1) % n]
         elif i == 0:
             a, b, c = points[0], points[1], points[2]
@@ -1766,10 +1906,6 @@ def clamp_widths_to_radius(points, widths, closed=False, ratio=None,
             a, b, c = points[i - 1], points[i], points[i + 1]
         cap = _xy_radius(a, b, c) / ratio if ratio > 0 else float("inf")
         hw.append(max(floor_hw, min(widths[i] / 2.0, cap)))
-    seg = [0.0] * n
-    for i in range(1, n):
-        d = points[i] - points[i - 1]
-        seg[i] = math.hypot(d.x, d.y)
     wrap = 0.0
     if closed:
         d = points[0] - points[-1]
@@ -1787,7 +1923,7 @@ def clamp_widths_to_radius(points, widths, closed=False, ratio=None,
     return out, worst
 
 
-def report_min_radius(name, points, widths, closed=False):
+def report_min_radius(name, points, widths, closed=False, authored=None):
     n = len(points)
     if n < 3:
         return
@@ -1801,18 +1937,22 @@ def report_min_radius(name, points, widths, closed=False):
         if ar < 1e-12 or A < 1e-9 or B < 1e-9:
             continue
         R = A * B * C / (4.0 * ar)
-        hw = (widths[i] if widths and i < len(widths) else 0.0) / 2.0
-        if hw > 1e-6:
-            rows.append((R / hw, R, hw, b))
+        built = (widths[i] if widths and i < len(widths) else 0.0) / 2.0
+        want = ((authored[i] if authored and i < len(authored) else 0.0) / 2.0
+                if authored else built)
+        if want > 1e-6:
+            rows.append((R / want, R, want, built, b))
     if not rows:
         return
     rows.sort(key=lambda r: r[0])
     if rows[0][0] < 3.0:
-        print(f"  [radius] '{name}': tightest corners (radius / half-width ratio)")
-        for ratio, R, hw, p in rows[:5]:
-            flag = "  <-- below 1: the inner edge folds over" if ratio < 1.0 else ""
-            print(f"           ratio {ratio:5.2f}   R={R:6.2f} m  half-width={hw:4.2f} "
-                  f"at ({p.x:.2f}, {p.y:.2f}){flag}")
+        print(f"  [radius] '{name}': tightest corners (radius / authored half-width)")
+        for ratio, R, want, built, p in rows[:5]:
+            flag = ("  <-- below 1: too tight to hold the authored width"
+                    if ratio < 1.0 else "")
+            note = "" if abs(built - want) < 5e-3 else f"  built={built:4.2f}"
+            print(f"           ratio {ratio:5.2f}   R={R:6.2f} m  half-width={want:4.2f}"
+                  f"{note} at ({p.x:.2f}, {p.y:.2f}){flag}")
 
 
 def tangent3d(points, i, closed=False):
@@ -3163,16 +3303,6 @@ def _line_cross(p, d, q, e):
 
 
 def solve_fan_junction(pa, da, hwa, pb, db, hwb, z=0.0):
-    """Two ribbons meeting at a junction. `da` leaves it, `db` arrives at it.
-
-    Their four edge lines always meet in a parallelogram, whatever the widths or
-    the angle. Only two of its corners matter: the inner one, where both ribbons
-    are cut off, and the outer one, which gets a fillet. The other two lie on the
-    ribbons' own edges and are not corners of the outline at all.
-
-    Returns None when the two are too close to parallel or to doubled back, since
-    the parallelogram then runs away to infinity.
-    """
     da = Vector((da.x, da.y, 0.0)).normalized()
     db = Vector((db.x, db.y, 0.0)).normalized()
     turn = math.degrees(math.acos(max(-1.0, min(1.0, da.dot(db)))))
@@ -3199,7 +3329,6 @@ def solve_fan_junction(pa, da, hwa, pb, db, hwb, z=0.0):
     outer_key = (-inner_key[0], -inner_key[1])
     inner, outer = cross[inner_key], cross[outer_key]
 
-    # how far each ribbon has to be cut back so it ends on the line through `inner`
     trim_a = (inner - pa).x * da.x + (inner - pa).y * da.y
     trim_b = (inner - pb).x * db.x + (inner - pb).y * db.y
 
@@ -3210,18 +3339,13 @@ def solve_fan_junction(pa, da, hwa, pb, db, hwb, z=0.0):
     if side_a < 1e-6 or side_b < 1e-6:
         return None
 
-    # unit vectors pointing from each side corner into the outer corner
     ea = (outer - corner_a).normalized()
     eb = (outer - corner_b).normalized()
-    # the interior angle at the outer corner is between the edges leaving it
     phi = math.acos(max(-1.0, min(1.0, ea.dot(eb))))
     half = phi / 2.0
     if half < 1e-4 or half > math.pi / 2.0 - 1e-4:
         return None
 
-    # the hub sits a perpendicular radius off both outer edges, so it stays inside
-    # the parallelogram only while the radius is under its narrower dimension; and
-    # the tangent points must not run past the side corners
     r_fit = min(2.0 * hwa, 2.0 * hwb)
     r_fit = min(r_fit, min(side_a, side_b) * math.tan(half))
     radius = max(0.0, min(r_fit * FAN_RADIUS_SCALE, FAN_MAX_RADIUS, r_fit))
@@ -3728,13 +3852,20 @@ ROLES = ["outer_near", "inner_near", "inner_far", "outer_far"]
 
 def build_cross_section(bm, point, normal, center_offset, mirror, width, height, extra_z_offset=0.0,
                          terrain_sampler=None, bevel_outer_edges=False, inset_override=None, uv_hw=None,
-                         up_world=None, tangent=None, cap_shrink=None, walk_split=None):
+                         up_world=None, tangent=None, cap_shrink=None, walk_split=None, join=None):
     hw_n = width / 2.0
+    s_near, s_far = (1.0, 1.0) if join is None else (float(join[0]), float(join[1]))
+    hw_near, hw_far = hw_n * s_near, hw_n * s_far
     if inset_override is None:
         inset_n = max(0.0, hw_n - CURB_STRIP)
+        inset_near = max(0.0, hw_near - CURB_STRIP)
+        inset_far = max(0.0, hw_far - CURB_STRIP)
     else:
         inset_n = max(0.0, min(float(inset_override), hw_n))
-    local_x = {"outer_near": -hw_n, "inner_near": -inset_n, "inner_far": inset_n, "outer_far": hw_n}
+        inset_near = max(0.0, min(float(inset_override), hw_near))
+        inset_far = max(0.0, min(float(inset_override), hw_far))
+    local_x = {"outer_near": -hw_near, "inner_near": -inset_near,
+               "inner_far": inset_far, "outer_far": hw_far}
     ht_n = height / 2.0
 
     chamfer, slope_h = 0.0, 0.0
@@ -3747,11 +3878,14 @@ def build_cross_section(bm, point, normal, center_offset, mirror, width, height,
         slope_h = max(0.0, min(ZEBRA_BEVEL_SIZE, hw_n - inset_n))
         chamfer = slope_h
     if slope_h > 1e-6 and chamfer > 1e-6:
-        ch_x = hw_n - slope_h
+        ch_near = hw_near - slope_h
+        ch_far = hw_far - slope_h
         if cap_shrink is not None:
             ch_x = max(inset_n, min(cap_shrink(slope_h), hw_n))
-        local_x["outer_near_chamfer"] = -ch_x
-        local_x["outer_far_chamfer"] = ch_x
+            ch_near = max(inset_near, min(ch_x * s_near, hw_near))
+            ch_far = max(inset_far, min(ch_x * s_far, hw_far))
+        local_x["outer_near_chamfer"] = -max(inset_near, min(ch_near, hw_near))
+        local_x["outer_far_chamfer"] = max(inset_far, min(ch_far, hw_far))
     else:
         chamfer, slope_h = 0.0, 0.0
 
@@ -3792,7 +3926,7 @@ def build_cross_section(bm, point, normal, center_offset, mirror, width, height,
         uv_inset_n = max(0.0, uvh - CURB_STRIP)
         for k, f in enumerate(walk_split):
             role = f"walk_{k}"
-            local_x[role] = inset_n * f
+            local_x[role] = (inset_far if f >= 0.0 else inset_near) * f
             uv_x[role] = uv_inset_n * f
             walk_roles.append(role)
 
@@ -3974,9 +4108,7 @@ def _guarded(fn):
 
 
 @_guarded
-def check_offsets(name, points, tangents, widths, miter, closed=False, skip=None):
-    """The swept edge must sit exactly half-width from the centreline segment it spans.
-    Catches a missing or wrong miter compensation, which silently narrows the ribbon."""
+def check_offsets(name, points, tangents, widths, miter, closed=False, skip=None, joins=None):
     if not VALIDATE or len(points) < 2:
         return
     worst, at = 0.0, None
@@ -3992,21 +4124,26 @@ def check_offsets(name, points, tangents, widths, miter, closed=False, skip=None
         dx, dy = (b.x - a.x) / seg, (b.y - a.y) / seg
         nx, ny = -dy, dx
         for k in (i, j):
-            hw = widths[k] / 2.0 * miter[k]
-            px = points[k].x - tangents[k].y * hw
-            py = points[k].y + tangents[k].x * hw
-            got = abs((px - a.x) * nx + (py - a.y) * ny)
-            err = abs(got - widths[k] / 2.0)
-            if err > worst:
-                worst, at = err, points[k]
+            if joins is not None and k < len(joins):
+                flanks = ((joins[k][1], 1.0), (joins[k][0], -1.0))
+            else:
+                flanks = ((miter[k], 1.0),)
+            for scale, side in flanks:
+                hw = widths[k] / 2.0 * scale
+                px = points[k].x - tangents[k].y * hw * side
+                py = points[k].y + tangents[k].x * hw * side
+                got = abs((px - a.x) * nx + (py - a.y) * ny)
+                want = widths[k] / 2.0 * min(1.0, scale)
+                err = (got - want) if (joins is not None and scale <= 1.0 + 1e-9) \
+                    else abs(got - want)
+                if err > worst:
+                    worst, at = err, points[k]
     if worst > VALIDATE_OFFSET_TOL:
         _flag(name, "offset", f"swept edge is {worst:.2f} m off the authored half-width", at)
 
 
 @_guarded
 def check_path_fidelity(name, authored, points):
-    """The built centreline must stay near the nodes the map author drew.
-    Catches relaxation or smoothing that quietly relocates the road."""
     if not VALIDATE or len(authored) < 2 or not points:
         return
     worst, at = 0.0, None
@@ -4030,8 +4167,6 @@ def _pt_seg_dist_2d(q, a, b):
 
 @_guarded
 def check_vertical(name, points):
-    """Adjacent rings must not disagree wildly about the slope.
-    Catches an XY-only move that left Z parameterised by the old arc length."""
     if not VALIDATE or len(points) < 3:
         return
     sl = []
@@ -4050,8 +4185,6 @@ def check_vertical(name, points):
 
 @_guarded
 def check_fold(name, points, tangents, offsets, closed=False, skip=None):
-    """Both offset edges must advance forwards across every span, or the surface
-    crosses itself and the classifier reports bowties."""
     if not VALIDATE or len(points) < 2:
         return
     rng = range(len(points)) if closed else range(len(points) - 1)
@@ -4066,8 +4199,6 @@ def check_fold(name, points, tangents, offsets, closed=False, skip=None):
 
 @_guarded
 def check_top_crease(name, points, tangents, widths, bands, closed=False):
-    """A ramp that turns while climbing is a helicoid; a level cross-section cannot
-    span it flat. Measures the crease left after the width is split into bands."""
     if not VALIDATE or len(points) < 2 or bands < 1:
         return
     worst, at = 0.0, None
@@ -4096,10 +4227,6 @@ def report_validation():
 
 
 def miter_scales(points, tangents, closed=False, radial=None):
-    """A miter widens the section so a corner keeps its width. It assumes the
-    section is perpendicular to the path. A fan section is radial from the pivot
-    by design, so the same formula reads the angle as a corner and blows the width
-    up - leave those at 1.0."""
     n = len(points)
     out = [1.0] * n
     if not MITER_COMPENSATION or n < 3:
@@ -4120,6 +4247,57 @@ def miter_scales(points, tangents, closed=False, radial=None):
     if not closed:
         out[0] = 1.0
         out[-1] = 1.0
+    return out
+
+
+def inner_side_flags(points, mirror=1.0, closed=False):
+    n = len(points)
+    sign = [0] * n
+    for i in range(n):
+        if not closed and (i == 0 or i == n - 1):
+            continue
+        a = points[i] - points[i - 1]
+        b = points[(i + 1) % n] - points[i]
+        crossz = a.x * b.y - a.y * b.x
+        la = math.hypot(a.x, a.y)
+        lb = math.hypot(b.x, b.y)
+        if la > 1e-9 and lb > 1e-9 and abs(crossz) / (la * lb) > 1e-4:
+            sign[i] = 1 if crossz > 0.0 else -1
+    known = [i for i in range(n) if sign[i]]
+    if not known:
+        return [None] * n
+    out = []
+    for i in range(n):
+        k = sign[i] or sign[min(known, key=lambda j: abs(j - i))]
+        left_is_inner = k > 0
+        if mirror < 0.0:
+            left_is_inner = not left_is_inner
+        out.append(left_is_inner)
+    return out
+
+
+def join_scales(points, miter, mirror=1.0, closed=False, radial=None, inner_scale=None):
+    n = len(points)
+    out = [(1.0, 1.0)] * n
+    if n < 3:
+        return out
+    has_clamp = bool(inner_scale) and len(inner_scale) == n
+    sides = inner_side_flags(points, mirror, closed)
+    for i in range(n):
+        m = miter[i] if i < len(miter) else 1.0
+        if m <= 1.0 + 1e-9:
+            m = 1.0
+        if radial and i < len(radial) and radial[i]:
+            m = 1.0
+        c = float(inner_scale[i]) if has_clamp else 1.0
+        if c > 1.0:
+            c = 1.0
+        inner = m * c
+        if abs(inner - 1.0) <= 1e-9:
+            continue
+        if sides[i] is None:
+            continue
+        out[i] = (1.0, inner) if sides[i] else (inner, 1.0)
     return out
 
 
@@ -4158,10 +4336,24 @@ def build_sidewalk_side(bm, uv_layer, points, tangents, dists, widths, heights, 
             walk_fracs = walk_split_fracs(walk_n, *spans[worst_at])
 
     miter = miter_scales(points, tangents, closed, radial)
+    asym = bool(ACTIVE_ASYM_JOIN[0] and abs(center_offset) < 1e-9)
+    inner_sc = ACTIVE_INNER_SCALE[0]
+    if inner_sc is not None and len(inner_sc) != len(points):
+        inner_sc = None
+    joins = join_scales(points, miter, mirror, closed, radial, inner_sc) if asym else None
+    if joins is not None:
+        n_asym = sum(1 for a, b in joins if a != 1.0 or b != 1.0)
+        if n_asym:
+            STATS["asym_joins"] = STATS.get("asym_joins", 0) + n_asym
 
     cross_sections = []
     for i, (p, t, w, h) in enumerate(zip(points, tangents, widths, heights)):
-        normal = Vector((-t.y, t.x, 0.0)) * miter[i]
+        cs_join = joins[i] if joins is not None else None
+        if cs_join is not None and (cs_join[0] != 1.0 or cs_join[1] != 1.0):
+            normal = Vector((-t.y, t.x, 0.0))
+        else:
+            cs_join = None
+            normal = Vector((-t.y, t.x, 0.0)) * miter[i]
         c = cap_of(i)
         cs_split = walk_fracs if walk_n > 1 else None
         cs_up = ACTIVE_UP[0](dists[i]) if ACTIVE_UP[0] is not None else None
@@ -4173,7 +4365,7 @@ def build_sidewalk_side(bm, uv_layer, points, tangents, dists, widths, heights, 
                                          else (c["uv_hw"] if c else None)),
                                   up_world=cs_up, tangent=cs_tan,
                                   cap_shrink=(c.get("shrink") if c else None),
-                                  walk_split=cs_split)
+                                  walk_split=cs_split, join=cs_join)
         cross_sections.append(cs)
 
     n = len(points)
@@ -4188,9 +4380,10 @@ def build_sidewalk_side(bm, uv_layer, points, tangents, dists, widths, heights, 
             return f"{role}_chamfer"
         return role
 
-    check_offsets(name_hint or "?", points, tangents, widths, miter, closed, radial)
+    check_offsets(name_hint or "?", points, tangents, widths, miter, closed, radial, joins)
     check_fold(name_hint or "?", points, tangents,
-               [widths[i] / 2.0 * miter[i] + abs(center_offset) for i in range(n_pts)],
+               [widths[i] / 2.0 * (max(joins[i]) if joins is not None else miter[i])
+                + abs(center_offset) for i in range(n_pts)],
                closed, radial)
     check_vertical(name_hint or "?", points)
     check_top_crease(name_hint or "?", points, tangents, widths, walk_n, closed)
@@ -4323,11 +4516,11 @@ def build_sidewalk_side(bm, uv_layer, points, tangents, dists, widths, heights, 
                 if 0 <= slot < len(names):
                     ACTIVE_TEXTURE_SCALE[0] = texture_scale_for(names[slot])
             has_chamfer = cs.get("_chamfer", 0.0) > 1e-6
-            cap_defs = [
-                ("outer_near", "inner_near", CURB, uv_cap_curb, True),
-                ("inner_near", "inner_far", WALK, uv_cap_walk, False),
-                ("inner_far", "outer_far", CURB, uv_cap_curb, True),
-            ]
+            cap_chain = ["inner_near"] + list(cs.get("_walk_roles") or []) + ["inner_far"]
+            cap_defs = ([("outer_near", "inner_near", CURB, uv_cap_curb, True)]
+                        + [(cap_chain[k], cap_chain[k + 1], WALK, uv_cap_walk, False)
+                           for k in range(len(cap_chain) - 1)]
+                        + [("inner_far", "outer_far", CURB, uv_cap_curb, True)])
             for role_a, role_b, mat, uv_fn, outer_side in cap_defs:
                 cs_height = cs["_height"]
                 outer_role = role_a if role_a in ("outer_near", "outer_far") else role_b
@@ -4773,15 +4966,28 @@ def build_colmesh_for_side(points, tangents, dists, widths, heights, center_offs
     bm = bmesh.new()
 
     miter = miter_scales(points, tangents, closed, radial)
-    check_offsets(f"{name} (collision)", points, tangents, widths, miter, closed, radial)
+    col_asym = bool(ACTIVE_ASYM_JOIN[0] and abs(center_offset) < 1e-9)
+    col_inner = ACTIVE_INNER_SCALE[0]
+    if col_inner is not None and len(col_inner) != len(points):
+        col_inner = None
+    col_joins = (join_scales(points, miter, mirror, closed, radial, col_inner)
+                 if col_asym else None)
+    check_offsets(f"{name} (collision)", points, tangents, widths, miter, closed, radial,
+                  col_joins)
 
     cs_list = []
     for i, (p, t, w, h) in enumerate(zip(points, tangents, widths, heights)):
-        normal = Vector((-t.y, t.x, 0.0)) * miter[i]
+        cs_join = col_joins[i] if col_joins is not None else None
+        if cs_join is not None and (cs_join[0] != 1.0 or cs_join[1] != 1.0):
+            normal = Vector((-t.y, t.x, 0.0))
+        else:
+            cs_join = None
+            normal = Vector((-t.y, t.x, 0.0)) * miter[i]
         c = caps[i] if (caps and i < len(caps)) else None
         cs_list.append(build_cross_section(bm, p, normal, center_offset, mirror, w, h,
                                             extra_z_offset, terrain_sampler, bevel_outer_edges,
                                             inset_override=(c["inset"] if c else None),
+                                            join=cs_join,
                                             cap_shrink=(c.get("shrink") if c else None),
                                             up_world=(ACTIVE_UP[0](dists[i])
                                                       if ACTIVE_UP[0] is not None else None),
@@ -4989,6 +5195,12 @@ def print_size_report(size_raw, size_final):
     if STATS.get("walk_split_roads"):
         print(f"  walk bands    : {STATS['walk_split_roads']:>9,}   "
               f"roads whose top surface was split across the width (helicoid)")
+    if STATS.get("mitre_tail_stripped"):
+        print(f"  mitre tails   : {STATS['mitre_tail_stripped']:>9,}   "
+              f"arc samples cleared from inside a mitre")
+    if STATS.get("mitre_rings_forced"):
+        print(f"  mitre rings   : {STATS['mitre_rings_forced']:>9,}   "
+              f"corner rings held against the fold guard")
     if STATS.get("fold_rings_dropped"):
         print(f"  fold guard    : {STATS['fold_rings_dropped']:>9,}   "
               f"rings dropped (spaced closer than the kerb offset could turn)")
@@ -5235,6 +5447,8 @@ def main():
             trimmed_widths = road.get("widths")
             trimmed_depths = road.get("depths")
 
+        road_inner_scale = None
+        road_mitre_pts = []
         if road["source"] == "meshroad":
             if MESHROAD_MIN_RADIUS_MARGIN > 0 and not road_closed:
                 nm = road.get("name") or f"R{r_idx}"
@@ -5259,7 +5473,7 @@ def main():
                           f"the inner kerb is very tight.")
             if MESHROAD_SMOOTH_CORNERS:
                 if MESHROAD_SHARP_CORNERS:
-                    points, trimmed_widths, trimmed_depths, n_sharp = \
+                    points, trimmed_widths, trimmed_depths, n_sharp, road_mitre_pts = \
                         sharpen_unroundable_corners(
                             points, trimmed_widths, trimmed_depths,
                             MESHROAD_SMOOTH_SEGMENT_LENGTH, MESHROAD_SMOOTH_MAX_TURN_DEG,
@@ -5273,17 +5487,43 @@ def main():
                     max_turn_deg=MESHROAD_SMOOTH_MAX_TURN_DEG
                 )
                 points, widths_m, heights_m = _dedupe(points, widths_m, heights_m)
+                if MESHROAD_MITRE_STRIP and road_mitre_pts:
+                    points, widths_m, heights_m, n_strip = strip_mitre_tail(
+                        points, widths_m, heights_m, road_mitre_pts)
+                    if n_strip:
+                        print(f"  [corner] '{road.get('name') or f'R{r_idx}'}': {n_strip} arc "
+                              f"sample(s) cleared from inside the mitred corners")
+                        STATS["mitre_tail_stripped"] = (
+                            STATS.get("mitre_tail_stripped", 0) + n_strip)
             else:
                 widths_m = trimmed_widths
                 heights_m = trimmed_depths
             road, points, widths_m, heights_m = apply_simplify(road, points, widths_m, heights_m)
+            road_inner_scale = None
             if MESHROAD_WIDTH_CLAMP and not road_closed:
-                widths_m, narrowed = clamp_widths_to_radius(points, widths_m, road_closed)
-                if narrowed > 0.005:
-                    print(f"  [width] '{road.get('name') or f'R{r_idx}'}': narrowed by up to "
-                          f"{narrowed:.2f} m through corners too tight for the authored width")
-                    STATS["width_clamped"] = STATS.get("width_clamped", 0) + 1
-            report_min_radius(road.get("name") or f"R{r_idx}", points, widths_m, road_closed)
+                clamped_w, narrowed = clamp_widths_to_radius(points, widths_m, road_closed)
+                if MESHROAD_CLAMP_INNER_ONLY:
+                    road_inner_scale = [
+                        (clamped_w[i] / widths_m[i]) if widths_m[i] > 1e-9 else 1.0
+                        for i in range(len(widths_m))
+                    ]
+                    if narrowed > 0.005:
+                        print(f"  [width] '{road.get('name') or f'R{r_idx}'}': inner edge pulled "
+                              f"in by up to {narrowed:.2f} m through corners too tight for the "
+                              f"authored width - the outer edge keeps its full half-width")
+                        STATS["width_clamped"] = STATS.get("width_clamped", 0) + 1
+                else:
+                    widths_m = clamped_w
+                    if narrowed > 0.005:
+                        print(f"  [width] '{road.get('name') or f'R{r_idx}'}': narrowed by up to "
+                              f"{narrowed:.2f} m through corners too tight for the authored width")
+                        STATS["width_clamped"] = STATS.get("width_clamped", 0) + 1
+            report_min_radius(road.get("name") or f"R{r_idx}", points,
+                              ([widths_m[i] * road_inner_scale[i] for i in range(len(widths_m))]
+                               if (road_inner_scale is not None
+                                   and len(road_inner_scale) == len(widths_m))
+                               else widths_m),
+                              road_closed, authored=widths_m)
             tangents = _tangents_for(road, points)
             dists = cumulative_distances(points)
             variants = [("M", 0.0, 1, widths_m, heights_m)]
@@ -5351,17 +5591,38 @@ def main():
             for _s, co, _m, vw, _vh in variants:
                 if not vw or len(vw) != len(points):
                     continue
-                cur = [abs(co) + x / 2.0 for x in vw]
+                sc = (road_inner_scale
+                      if (road_inner_scale is not None and len(road_inner_scale) == len(vw))
+                      else None)
+                cur = [abs(co) + (x / 2.0) * (sc[k] if sc else 1.0)
+                       for k, x in enumerate(vw)]
                 offsets = cur if offsets is None else [max(a, b) for a, b in zip(offsets, cur)]
             sec = road.get("section_tangents")
             forced_flags = ([v is not None for v in sec]
                             if sec and len(sec) == len(points) else None)
+            if MESHROAD_FORCE_MITRE_RINGS and road_mitre_pts:
+                if forced_flags is None:
+                    forced_flags = [False] * len(points)
+                n_forced = 0
+                for mp, _run in road_mitre_pts:
+                    best, best_d = None, MESHROAD_MITRE_MATCH_DIST
+                    for k, p in enumerate(points):
+                        d = math.hypot(p.x - mp.x, p.y - mp.y)
+                        if d < best_d:
+                            best, best_d = k, d
+                    if best is not None and not forced_flags[best]:
+                        forced_flags[best] = True
+                        n_forced += 1
+                if n_forced:
+                    STATS["mitre_rings_forced"] = STATS.get("mitre_rings_forced", 0) + n_forced
             keep = non_folding_keep(points, tangents, offsets, road_closed, forced_flags,
                                     MESHROAD_MIN_EDGE_ADVANCE_FRAC
                                     if road["source"] == "meshroad" else 0.0)
             if 2 < len(keep) < len(points):
                 n_dropped = len(points) - len(keep)
                 STATS["fold_rings_dropped"] = STATS.get("fold_rings_dropped", 0) + n_dropped
+                if road_inner_scale is not None and len(road_inner_scale) > max(keep):
+                    road_inner_scale = [road_inner_scale[i] for i in keep]
                 points = [points[i] for i in keep]
                 tangents = [tangents[i] for i in keep]
                 dists = [dists[i] for i in keep]
@@ -5383,6 +5644,12 @@ def main():
                           or bpy.data.materials.new(mr_curb_name)) if is_mr else mat_curb)
         ACTIVE_KEEP_BOTTOM[0] = bool(is_mr and st_res["bottom"])
         ACTIVE_WALK_SPLIT[0] = bool(is_mr and MESHROAD_WALK_SPLIT)
+        ACTIVE_ASYM_JOIN[0] = bool(is_mr and MESHROAD_ASYM_JOIN)
+        ACTIVE_INNER_SCALE[0] = (road_inner_scale
+                                 if (is_mr and MESHROAD_ASYM_JOIN
+                                     and road_inner_scale is not None
+                                     and len(road_inner_scale) == len(points))
+                                 else None)
         ACTIVE_TEXTURE_SCALE[1] = (texture_scale_for(mr_curb_name) if is_mr
                                    else curb_scale_for(CURB_MATERIAL_NAME))
         if is_mr:
@@ -5495,8 +5762,6 @@ def main():
 
 
 def _purge_startup_scene():
-    """Headless Blender opens its startup scene (cube, camera, light). Nothing in
-    it is ours, and a stray object must never reach the exporter."""
     if bpy.data.filepath:
         return
     for ob in list(bpy.data.objects):
