@@ -6,6 +6,10 @@ Mark them out in the World Editor, run one script, and everything else builds it
 
 The script reads your map files directly and, in a single run, builds the sidewalks with rounded junctions and capped ends — a finish that's hard to achieve by hand.
 
+[![Watch the demo](https://img.youtube.com/vi/o2l4EGroNT4/maxresdefault.jpg)](https://youtu.be/o2l4EGroNT4)
+
+*Click the image to watch the demo.*
+
 ---
 
 ## Contents
@@ -55,7 +59,7 @@ Download the latest release from **Releases** (e.g. `sidewalk_pit_1.0.0.zip`) an
 
 | File | What it is |
 |---|---|
-| `sidewalk_pit_mod.zip` | The tool that runs inside the game |
+| `sidewalk_pit_mod.zip` | The tool that runs inside the game, including the preview and the language files |
 | `sidewalk_pit.py` | The script that builds the geometry in Blender |
 
 ### `sidewalk_pit_mod.zip` — the in-game tool
@@ -66,13 +70,13 @@ Download the latest release from **Releases** (e.g. `sidewalk_pit_1.0.0.zip`) an
 %LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods\
 ```
 
-**Option 2 — as a single file.** Extract the zip and take `sidewalkTags.lua` from it into:
+**Option 2 — as loose files.** Extract the zip and copy **both** Lua files — `sidewalkTags.lua` and `sidewalkPreview.lua` — into:
 
 ```
 %LOCALAPPDATA%\BeamNG\BeamNG.drive\current\lua\ge\extensions\editor\
 ```
 
-> With option 2 the `editor` folder doesn't exist yet — you have to create it, along with any missing folders above it.
+> With option 2 the `editor` folder doesn't exist yet — you have to create it, along with any missing folders above it. Note that both files are required: `sidewalkTags.lua` loads `sidewalkPreview.lua`, and without it the tool won't load at all. The language folders in the zip aren't copied this way, so the UI stays in English.
 
 Start the game. The tool appears in the World Editor under **Window → PIT → Sidewalk Tags**.
 
@@ -96,11 +100,11 @@ The script itself isn't installed anywhere — it's not an add-on and not part o
    > **Tip:** tick **likely candidates** to narrow the list down to materials that look like paving, kerb or wall by name.
 
 5. Repeat step 4 for the kerb material — this time tick **curb edge** and also **also set as the map's curb material**
-6. Draw a **DecalRoad** along the sidewalk you want, with the material **`WarningMaterial`**
-7. Select the DecalRoads you drew and click the style button you want in the tool window
+6. Draw a **DecalRoad** along the sidewalk you want
+7. Select what you drew, click **mark as sidewalk**, then the style button you want. **render selection** will show you the result right away
 8. **Save the map** — mandatory, otherwise Blender sees nothing
 9. In Blender: **Scripting** tab → **Open** → pick `sidewalk_pit.py`, update `LEVEL_NAME` at the top of the file, and press **Run Script** (▶)
-10. In the **Asset Browser**, go to `art/shapes/sidewalk` and add `sidewalk_pit.dae`
+10. Restart the game, then in the **Asset Browser** go to `art/shapes/sidewalk` and add `sidewalk_pit.dae`
 
 Steps 6–9 repeat on every work cycle. Steps 1–5 and 10 are one-time per map.
 
@@ -110,7 +114,9 @@ Steps 6–9 repeat on every work cycle. Steps 1–5 and 10 are one-time per map.
 
 **The mod builds only from what you marked with the `WarningMaterial`** — the orange one with NO MATERIAL written on it. On a MeshRoad, leaving the materials empty counts the same. Any object with a real material is skipped on purpose, so existing roads on the map don't turn into sidewalks.
 
-> **If `WarningMaterial` isn't in the material list:** create any new road on the map. You can delete it immediately; next time you open the list it'll be there. Known game bug.
+The quick way to mark them: select the objects and click **mark as sidewalk** in the tool window, and the material is written to all of them at once.
+
+> **If you're picking `WarningMaterial` by hand and it isn't in the material list:** create any new road on the map. You can delete it immediately; next time you open the list it'll be there. Known game bug.
 
 ### Sidewalk → DecalRoad
 
@@ -179,6 +185,26 @@ The tool does two things: it manages the map's materials and styles, and it lets
 | bottom faces | `pit_bottom` | MeshRoad | `on` / `off` |
 | banking from nodes | `pit_roll` | MeshRoad | `on` / `off` |
 
+### Preview inside the editor
+
+You don't have to run the script to see what you'll get. Select some objects and click **render selection** — the sidewalk is drawn in the editor exactly as it will be built, rounded corners, caps and materials included.
+
+- **The preview isn't saved with the map.** It only exists in the current session, and **clear preview** removes it
+- **auto refresh** re-renders as you drag nodes. There's a **delay (s)** field to control the rate, and it switches itself off above 12 roads so the editor stays responsive
+- It doesn't replace running the script — the preview is editor-only drawing, and the file that goes into your map is still produced in Blender
+
+> **In rare edge cases the preview will look slightly different from the final result.** Two separate implementations compute the same geometry, one in Lua and one in Python, and they're calibrated against each other — but at unusual junctions or extreme turns a small difference is possible. The script's output is always the authoritative one.
+
+### Marking the material in one click
+
+Instead of hunting for `WarningMaterial` in the material list: select the objects and click **mark as sidewalk**. The button writes the material to every DecalRoad and MeshRoad in the selection and skips anything already marked. It goes through the editor's undo history, so Ctrl+Z reverses it.
+
+### Interface languages
+
+The tool is translated into 13 languages and follows the game's language: German, English, Spanish (Latin America and Spain), French, Japanese, Korean, Polish, Portuguese (Brazil and Portugal), Russian, and Chinese (Simplified and Traditional).
+
+> **The translations are machine-translated and haven't been checked by native speakers.** Expect inaccuracies, especially in technical terms. If you spot a bad string in your language, open an Issue — a one-string fix is very welcome.
+
 ### Main buttons
 
 | Button | What it does |
@@ -187,6 +213,8 @@ The tool does two things: it manages the map's materials and styles, and it lets
 | **reload config** | Reloads from disk, after a manual edit |
 | **the colour buttons** | Write the tag to everything selected; **clear X** clears it |
 | **select decals** / **select MeshRoad** | Select every relevant object on the map |
+| **mark as sidewalk** | Writes `WarningMaterial` to everything selected |
+| **render selection** / **clear preview** | Shows and clears the preview |
 | **scan now** | Scans and shows how many are tagged and with what. A tag in **red** = a value that doesn't exist in the config |
 
 ### advanced — adding materials
@@ -214,7 +242,9 @@ art/shapes/sidewalk/sidewalk_pit.dae
 
 **Once per map only:**
 
-1. Open the **Asset Browser** and go to `art/shapes/sidewalk`
+> **After the first run you have to restart the game.** The `.dae` is created while the game is already running, so it won't show up in the Asset Browser until you restart. This is only needed the first time — later runs just update the existing file.
+
+1. Restart the game, open the **Asset Browser** and go to `art/shapes/sidewalk`
 2. Add `sidewalk_pit.dae` to the map
 3. **Fix the Transform** — the object lands at a random position. Select it and, in the **Inspector**, zero the values in the **Transform** section exactly like this:
 
@@ -362,6 +392,8 @@ CURB_PROFILES = {
 ## Credits
 
 `sidewalk_pit.py` was written by **rtacyyv**.
+
+**AI disclosure:** the in-editor preview is a second implementation of the same geometry, in Lua. Translating the geometry algorithms from Python to Lua, and calibrating the two implementations so they produce the same result, was done with AI assistance.
 
 ---
 
