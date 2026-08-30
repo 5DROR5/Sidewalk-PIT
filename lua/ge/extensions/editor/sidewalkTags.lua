@@ -1,8 +1,8 @@
---  PIT sidewalk tagging tool
-
+-- PIT sidewalk tags - tags DecalRoads and MeshRoads for the Blender script, and drives the preview
 
 local M = {}
 local logTag = 'sidewalkTags'
+local preview = require('editor/sidewalkPreview')
 local imgui = ui_imgui
 
 local toolWindowName = "pitSidewalkTags"
@@ -30,8 +30,13 @@ local AXES = {"curb", "walk", "profile"}
 local MR_AXES = {"wall", "bottom", "roll"}
 local ALL_AXES = {"curb", "walk", "profile", "wall", "bottom", "roll"}
 
+local livePtr = imgui.BoolPtr(false)
+local liveDelayPtr = imgui.FloatPtr(0.3)
 local rtlLayout = false
 local rtlCache = {}
+local rtlCacheN = 0
+local visualCache = {}
+local visualCacheN = 0
 
 local mirrorMap = {
   ["("] = ")", [")"] = "(",
@@ -95,6 +100,66 @@ local function flipToVisual(s)
   return table.concat(rev)
 end
 
+local function transKey(s)
+  local k = s:lower():gsub("[^0-9a-z]+", "_"):gsub("^_+", ""):gsub("_+$", "")
+  return "pit.ui." .. k:sub(1, 60)
+end
+
+local function lookup(s)
+  if type(s) ~= "string" or s == "" or isRtlText(s) then return s end
+  if not (core_locales and core_locales.translate) then return s end
+  local ok, v = pcall(core_locales.translate, transKey(s), s)
+  if ok and type(v) == "string" and v ~= "" then return v end
+  return s
+end
+
+local function tr(f, ...)
+  local s = lookup(f)
+  if select("#", ...) == 0 then return s end
+  local ok, out = pcall(string.format, s, ...)
+  if ok then return out end
+  local ok2, out2 = pcall(string.format, f, ...)
+  return ok2 and out2 or f
+end
+
+local function flipLines(s)
+  if not s:find("\n", 1, true) then return flipToVisual(s) end
+  local out = {}
+  for line in (s .. "\n"):gmatch("([^\n]*)\n") do
+    out[#out + 1] = flipToVisual(line)
+  end
+  return table.concat(out, "\n")
+end
+
+local function visual(s)
+  if s == nil or s == "" then return s end
+  local cached = visualCache[s]
+  if cached then return cached end
+
+  local label, idPart = s, ""
+  local p = s:find("##", 1, true)
+  if p then
+    label = s:sub(1, p - 1)
+    idPart = s:sub(p)
+  end
+
+  local result
+  if isRtlText(label) then
+    rtlLayout = true
+    result = flipLines(label) .. idPart
+  else
+    result = label .. idPart
+  end
+
+  visualCacheN = visualCacheN + 1
+  if visualCacheN > 512 then
+    visualCache = {}
+    visualCacheN = 0
+  end
+  visualCache[s] = result
+  return result
+end
+
 local function rtl(s)
   if s == nil or s == "" then return s end
   local cached = rtlCache[s]
@@ -107,7 +172,13 @@ local function rtl(s)
     idPart = s:sub(p)
   end
 
-  local result = isRtlText(label) and (flipToVisual(label) .. idPart) or s
+  local result = visual(lookup(label) .. idPart)
+
+  rtlCacheN = rtlCacheN + 1
+  if rtlCacheN > 512 then
+    rtlCache = {}
+    rtlCacheN = 0
+  end
   rtlCache[s] = result
   return result
 end
@@ -132,8 +203,7 @@ local function alignRight(width)
   end
 end
 
-local function text(s, col)
-  local v = rtl(s)
+local function drawText(v, col)
   if rtlLayout then
     local ok, size = pcall(imgui.CalcTextSize, v)
     if ok and size then alignRight(size.x) end
@@ -145,9 +215,19 @@ local function text(s, col)
   end
 end
 
--- ---------------------------------------------------------------------------
--- config
--- ---------------------------------------------------------------------------
+local function text(s, col)
+  drawText(rtl(s), col)
+end
+
+local function textv(s, col)
+  drawText(visual(s), col)
+end
+
+local function tip(s)
+  if imgui.IsItemHovered() then
+    imgui.SetTooltip(rtl(s))
+  end
+end
 
 local cfg = nil
 local cfgPath = ""
@@ -219,6 +299,10 @@ local function curbUsesAtlas()
 end
 
 local function loadConfig()
+  rtlCache = {}
+  rtlCacheN = 0
+  visualCache = {}
+  visualCacheN = 0
   cfg, palette, cfgError = nil, nil, nil
   cfgMissing = false
   cfgEmpty = false
@@ -293,10 +377,6 @@ local function loadConfig()
 
   cfg = data
 end
-
--- ---------------------------------------------------------------------------
--- material picking
--- ---------------------------------------------------------------------------
 
 local matSet = nil
 local matFilter = imgui.ImGuiTextFilter()
@@ -421,13 +501,11 @@ local function isSolidMaterial(mat, name)
   return matClass(mat, name) == "opaque"
 end
 
-
 local CANDIDATE_DENY = {
   "annotation", "checkpoint", "marker", "rooftile", "roof_tile", "invisible",
   "unmapped", "noshape", "default", "editor", "debug", "test", "lod",
   "decal", "damage", "eroded", "destroyed", "leak", "dirty",
 }
-
 
 local CANDIDATE_RULES = {
   {axis = "curb", rank = 1, keys = {"curb", "kerb", "gutter"}},
@@ -476,7 +554,6 @@ local function writeJson(path, data)
   end
   return false
 end
-
 
 local function slug(s)
   s = tostring(s or ""):lower():gsub("[^%w]+", "_"):gsub("^_+", ""):gsub("_+$", "")
@@ -546,7 +623,6 @@ local function emptyConfigData()
   }
 end
 
-
 local function createEmptyConfig()
   if cfgPath == "" then
     statusText = "no level loaded"
@@ -558,7 +634,7 @@ local function createEmptyConfig()
   end
   if not commitConfig(emptyConfigData()) then return false end
   loadConfig()
-  statusText = "created " .. CONFIG_NAME
+  statusText = tr("created %s", CONFIG_NAME)
   log('I', logTag, statusText)
   return true
 end
@@ -589,7 +665,7 @@ local function removeStyleFromConfig(axis, key)
   local styles = (data[axis] or {}).styles
   local st = styles and styles[key]
   if not st then
-    statusText = "style not found: " .. tostring(key)
+    statusText = tr("style not found: %s", tostring(key))
     return
   end
 
@@ -619,11 +695,13 @@ local function removeStyleFromConfig(axis, key)
 
   if not commitConfig(data) then return end
   loadConfig()
-  statusText = string.format("removed %s from %s%s", key, axis,
-                             unlinked > 0
-                               and string.format(" (%d sequence link%s cleared)",
-                                                 unlinked, unlinked == 1 and "" or "s")
-                               or "")
+  local links = ""
+  if unlinked == 1 then
+    links = tr(" (1 sequence link cleared)")
+  elseif unlinked > 1 then
+    links = tr(" (%d sequence links cleared)", unlinked)
+  end
+  statusText = tr("removed %s from %s", key, axis) .. links
   log('I', logTag, statusText)
 end
 
@@ -684,18 +762,14 @@ local function addMaterialToConfig(matName, axis, su, sv, label, asCurbMat, asMe
   local wasAtlas = dataCurbUsesAtlas(data)
   loadConfig()
   if axis == "curb" and wasAtlas then
-    statusText = string.format("%s (%s) added to %s as band %d  [%s]",
-                               label, matName, axis, newBand[0], key)
+    statusText = tr("%s (%s) added to %s as band %d  [%s]",
+                    label, matName, axis, newBand[0], key)
   else
-    statusText = string.format("%s (%s) added to %s at scale %.2f x %.2f  [%s]",
-                               label, matName, axis, su, sv, key)
+    statusText = tr("%s (%s) added to %s at scale %.2f x %.2f  [%s]",
+                    label, matName, axis, su, sv, key)
   end
   log('I', logTag, statusText)
 end
-
--- ---------------------------------------------------------------------------
--- scene access
--- ---------------------------------------------------------------------------
 
 local function getSelection()
   if not editor or not editor.selection then return {} end
@@ -749,14 +823,10 @@ local function applyValue(fieldName, value)
   editor.history:endTransaction()
 
   statusText = (value == "")
-    and string.format("cleared %s from %d objects", fieldName, #ids)
-    or string.format("%s = %s written to %d objects", fieldName, value, #ids)
+    and tr("cleared %s from %d objects", fieldName, #ids)
+    or tr("%s = %s written to %d objects", fieldName, value, #ids)
   log('I', logTag, statusText)
 end
-
--- ---------------------------------------------------------------------------
--- coverage
--- ---------------------------------------------------------------------------
 
 local coverage = nil
 
@@ -814,7 +884,7 @@ local function scanCoverage()
       if not tagged then coverage.untagged = coverage.untagged + 1 end
     end
   end
-  statusText = string.format("scanned %d decals", coverage.total)
+  statusText = tr("scanned %d decals", coverage.total)
 end
 
 local MARKER_MATERIAL = "WarningMaterial"
@@ -862,20 +932,16 @@ local function selectIds(ids)
   if editor.selectObjects then
     local ok = pcall(editor.selectObjects, ids)
     if ok then
-      statusText = string.format("selected %d objects", #ids)
+      statusText = tr("selected %d objects", #ids)
       return
     end
   end
   if editor.selectObjectById then
     if editor.clearObjectSelection then editor.clearObjectSelection() end
     for i = 1, #ids do pcall(editor.selectObjectById, ids[i]) end
-    statusText = string.format("selected %d objects", #ids)
+    statusText = tr("selected %d objects", #ids)
   end
 end
-
--- ---------------------------------------------------------------------------
--- gui
--- ---------------------------------------------------------------------------
 
 local BTN_W = 122
 local PER_ROW = 2
@@ -891,8 +957,8 @@ local function paletteButton(entry, axis, isActive)
     pushes = 4
   end
 
-  local label = entry.label .. (isActive and "  <" or "")
-  local clicked = imgui.Button(rtl(label) .. "##" .. axis .. "_" .. entry.value,
+  local label = lookup(entry.label) .. (isActive and "  <" or "")
+  local clicked = imgui.Button(visual(label) .. "##" .. axis .. "_" .. entry.value,
                                imgui.ImVec2(BTN_W, 0))
 
   for _ = 1, pushes do imgui.PopStyleColor() end
@@ -903,13 +969,17 @@ local function paletteButton(entry, axis, isActive)
   return clicked
 end
 
-local function section(title, defaultOpen)
+local function sectionv(title, defaultOpen)
   if sectionForce ~= nil then
     pcall(imgui.SetNextItemOpen, sectionForce)
   elseif defaultOpen then
     pcall(imgui.SetNextItemOpen, true, imgui.Cond_FirstUseEver)
   end
-  return imgui.CollapsingHeader1(rtl(title))
+  return imgui.CollapsingHeader1(visual(title))
+end
+
+local function section(title, defaultOpen)
+  return sectionv(lookup(title), defaultOpen)
 end
 
 local function drawAxis(axis, ids, hasSelection)
@@ -917,7 +987,7 @@ local function drawAxis(axis, ids, hasSelection)
   if not ax or #ax.entries == 0 then return end
   local field = fieldOf[axis]
 
-  if not section(ax.label .. "  (" .. field .. ")", true) then return end
+  if not sectionv(lookup(ax.label) .. "  (" .. field .. ")", true) then return end
 
   local current, state = selectionValue(ids, field)
 
@@ -931,8 +1001,9 @@ local function drawAxis(axis, ids, hasSelection)
         break
       end
     end
-    text("current: " .. tostring(current) .. (known and "" or "  (not in config)"),
-         known and imgui.ImVec4(0.4, 1, 0.4, 1) or imgui.ImVec4(1, 0.45, 0.35, 1))
+    textv(tr("current: %s%s", tostring(current),
+             known and "" or tr("  (not in config)")),
+          known and imgui.ImVec4(0.4, 1, 0.4, 1) or imgui.ImVec4(1, 0.45, 0.35, 1))
   else
     text("current: (untagged - default)", imgui.ImVec4(0.6, 0.6, 0.6, 1))
   end
@@ -982,7 +1053,7 @@ local function drawCoverage()
       statusText = "no untextured MeshRoad found"
     else
       selectIds(ids)
-      statusText = string.format("selected %d untextured MeshRoad", #ids)
+      statusText = tr("selected %d untextured MeshRoad", #ids)
     end
   end
   imgui.SameLine()
@@ -992,10 +1063,24 @@ local function drawCoverage()
       statusText = "no marked decals found"
     else
       selectIds(ids)
-      statusText = string.format("selected %d marked decals", #ids)
+      statusText = tr("selected %d marked decals", #ids)
     end
   end
-  text("MeshRoad = no real material.  decals = material is " .. MARKER_MATERIAL,
+  alignRight(BTN_W * 2 + 8)
+  if imgui.Button(rtl("select all") .. "##selall", imgui.ImVec2(BTN_W * 2 + 8, 0)) then
+    local ids = findUnskinned("MeshRoad")
+    local meshTotal = #ids
+    local decals = findUnskinned("DecalRoad")
+    for i = 1, #decals do ids[#ids + 1] = decals[i] end
+    if #ids == 0 then
+      statusText = "nothing untagged found"
+    else
+      selectIds(ids)
+      statusText = tr("selected %d objects  (MeshRoad: %d, decals: %d)",
+                      #ids, meshTotal, #decals)
+    end
+  end
+  text("shows only MeshRoad and decals with the warning material",
        imgui.ImVec4(0.5, 0.5, 0.5, 1))
 
   alignRight(BTN_W)
@@ -1009,7 +1094,7 @@ local function drawCoverage()
     return
   end
 
-  text(string.format("decals total: %d   untagged: %d", coverage.total, coverage.untagged))
+  textv(tr("decals total: %d   untagged: %d", coverage.total, coverage.untagged))
 
   for _, axis in ipairs(ALL_AXES) do
     local rows = {}
@@ -1018,7 +1103,7 @@ local function drawCoverage()
     end
     if #rows > 0 then
       table.sort(rows, function(a, b) return a.n > b.n end)
-      text(palette[axis].label .. ":")
+      textv(lookup(palette[axis].label) .. ":")
       for _, r in ipairs(rows) do
         alignRight(250)
         if imgui.Button(rtl("select") .. "##sel_" .. axis .. "_" .. r.value, imgui.ImVec2(56, 0)) then
@@ -1038,12 +1123,12 @@ local function scaleHint(su, sv)
   local known = cfg and cfg.materials and cfg.materials[selectedMat]
   local sc = known and known.scale
   if type(sc) == "table" and #sc >= 2 then
-    old = string.format("   (config now: %.2f x %.2f)", sc[1], sc[2])
+    old = tr("   (config now: %.2f x %.2f)", sc[1], sc[2])
   elseif type(sc) == "number" then
-    old = string.format("   (config now: %.2f)", sc)
+    old = tr("   (config now: %.2f)", sc)
   end
-  return string.format("U %.2f m/tile - %.1f tiles per 10 m along", su, 10.0 / su),
-         string.format("V %.2f m/tile - %.1f tiles per 10 m across%s", sv, 10.0 / sv, old)
+  return tr("U %.2f m/tile - %.1f tiles per 10 m along", su, 10.0 / su),
+         tr("V %.2f m/tile - %.1f tiles per 10 m across%s", sv, 10.0 / sv, old)
 end
 
 local function drawAdvanced()
@@ -1058,20 +1143,16 @@ local function drawAdvanced()
   end
 
   imgui.PushID1("pitMatFilter")
-  pcall(imgui.ImGuiTextFilter_Draw, matFilter, "Search...", 200)
+  pcall(imgui.ImGuiTextFilter_Draw, matFilter, rtl("Search..."), 200)
   imgui.PopID()
   imgui.Checkbox(rtl("solid materials only") .. "##opaqueonly", opaqueOnly)
-  if imgui.IsItemHovered() then
-    imgui.SetTooltip("keeps only materials that fully cover a surface.\n"
-                     .. "hides alpha cutouts, glows and blended overlays.\n"
-                     .. "solid decal roads stay.")
-  end
+  tip("keeps only materials that fully cover a surface.\n"
+      .. "hides alpha cutouts, glows and blended overlays.\n"
+      .. "solid decal roads stay.")
   imgui.SameLine()
   imgui.Checkbox(rtl("likely candidates") .. "##likelyonly", likelyOnly)
-  if imgui.IsItemHovered() then
-    imgui.SetTooltip("narrows the list to paving and walling materials by name.\n"
-                     .. "a suggestion, not a rule - switch it off to see everything.")
-  end
+  tip("narrows the list to paving and walling materials by name.\n"
+      .. "a suggestion, not a rule - switch it off to see everything.")
 
   local hidden = 0
   local narrowed = 0
@@ -1156,13 +1237,13 @@ local function drawAdvanced()
     matError = tostring(listErr)
   end
   if matError then
-    text("list error: " .. matError, imgui.ImVec4(1, 0.45, 0.35, 1))
+    textv(tr("list error: %s", matError), imgui.ImVec4(1, 0.45, 0.35, 1))
   end
   if hidden > 0 or narrowed > 0 then
     local parts = {}
-    if hidden > 0 then parts[#parts + 1] = hidden .. " transparent" end
-    if narrowed > 0 then parts[#parts + 1] = narrowed .. " off-topic" end
-    text(table.concat(parts, ", ") .. " hidden", imgui.ImVec4(0.6, 0.6, 0.6, 1))
+    if hidden > 0 then parts[#parts + 1] = tr("%d transparent", hidden) end
+    if narrowed > 0 then parts[#parts + 1] = tr("%d off-topic", narrowed) end
+    textv(tr("%s hidden", table.concat(parts, ", ")), imgui.ImVec4(0.6, 0.6, 0.6, 1))
   end
 
   if not selectedMat then
@@ -1190,23 +1271,22 @@ local function drawAdvanced()
   end
 
   if #uses > 0 then
-    text(string.format("already used by %d style%s:", #uses, #uses == 1 and "" or "s"),
-         imgui.ImVec4(1, 0.7, 0.2, 1))
+    textv(#uses == 1 and tr("already used by 1 style:")
+                      or tr("already used by %d styles:", #uses),
+          imgui.ImVec4(1, 0.7, 0.2, 1))
     for _, u in ipairs(uses) do
       if imgui.Button(rtl("remove") .. "##rm_" .. u.axis .. "_" .. u.key,
                       imgui.ImVec2(70, 0)) then
         removeStyleFromConfig(u.axis, u.key)
       end
       imgui.SameLine()
-      text(string.format("%s . %s   (%s)", u.axis, u.key, u.label),
-           imgui.ImVec4(0.75, 0.75, 0.75, 1))
+      textv(string.format("%s . %s   (%s)", u.axis, u.key, lookup(u.label)),
+            imgui.ImVec4(0.75, 0.75, 0.75, 1))
     end
     imgui.Checkbox(rtl("add as a new style") .. "##newstyle", asNewStyle)
-    if imgui.IsItemHovered() then
-      imgui.SetTooltip("off: update the matching style in place.\n"
-                       .. "on: keep the existing one and add another, so the same\n"
-                       .. "material can appear at several scales.")
-    end
+    tip("off: update the matching style in place.\n"
+        .. "on: keep the existing one and add another, so the same\n"
+        .. "material can appear at several scales.")
   end
 
   imgui.PushItemWidth(-1)
@@ -1216,9 +1296,9 @@ local function drawAdvanced()
        imgui.ImVec4(0.5, 0.5, 0.5, 1))
 
   imgui.PushItemWidth(90)
-  imgui.DragFloat("U##su", newScaleU, 0.01, 0.05, 64.0, "%.2f")
+  imgui.DragFloat(rtl("U##su"), newScaleU, 0.01, 0.05, 64.0, "%.2f")
   imgui.SameLine()
-  imgui.DragFloat("V##sv", newScaleV, 0.01, 0.05, 64.0, "%.2f")
+  imgui.DragFloat(rtl("V##sv"), newScaleV, 0.01, 0.05, 64.0, "%.2f")
   imgui.PopItemWidth()
 
   local hintU, hintV = scaleHint(newScaleU[0], newScaleV[0])
@@ -1234,7 +1314,7 @@ local function drawAdvanced()
   if newAxis[0] == 0 then
     if curbUsesAtlas() then
       imgui.PushItemWidth(90)
-      imgui.InputInt("band##curbband", newBand)
+      imgui.InputInt(rtl("band##curbband"), newBand)
       imgui.PopItemWidth()
       if newBand[0] < 0 then newBand[0] = 0 end
       text("this map's curb material is an atlas, so a curb style selects a "
@@ -1247,12 +1327,10 @@ local function drawAdvanced()
     end
   end
 
-
   if newAxis[0] == 0 and cfg and cfg.curb and cfg.curb.material
      and cfg.curb.material ~= selectedMat then
-    text("curb.material is " .. tostring(cfg.curb.material)
-         .. " - this style will be drawn with that material, not "
-         .. selectedMat, imgui.ImVec4(1, 0.7, 0.2, 1))
+    textv(tr("curb.material is %s - this style will be drawn with that material, not %s",
+             tostring(cfg.curb.material), selectedMat), imgui.ImVec4(1, 0.7, 0.2, 1))
     text("curb styles vary band or scale only. tick the box below to replace"
          .. " the map's kerb material instead", imgui.ImVec4(0.6, 0.6, 0.6, 1))
   end
@@ -1263,9 +1341,9 @@ local function drawAdvanced()
        .. " kerb or wall material added sets them automatically",
        imgui.ImVec4(0.5, 0.5, 0.5, 1))
   if cfg and cfg.curb then
-    text(string.format("now: curb.material = %s   meshroadMaterial = %s",
-                       tostring(cfg.curb.material or "(unset)"),
-                       tostring(cfg.curb.meshroadMaterial or "(unset)")),
+    textv(tr("now: curb.material = %s   meshroadMaterial = %s",
+             tostring(cfg.curb.material or tr("(unset)")),
+             tostring(cfg.curb.meshroadMaterial or tr("(unset)"))),
          (cfg.curb.material and imgui.ImVec4(0.5, 0.5, 0.5, 1))
                             or imgui.ImVec4(1, 0.45, 0.35, 1))
   end
@@ -1283,10 +1361,11 @@ local function drawAdvanced()
 end
 
 local function onEditorGui()
+  preview.refreshLive()
   ensureRegistered()
   if not editor.isWindowVisible(toolWindowName) then return end
 
-  if editor.beginWindow(toolWindowName, "PIT - Sidewalk Tags") then
+  if editor.beginWindow(toolWindowName, rtl("PIT - Sidewalk Tags")) then
     alignRight(BTN_W * 2 + 8)
     if imgui.Button(rtl("collapse all") .. "##collapseall", imgui.ImVec2(BTN_W, 0)) then
       sectionForce = false
@@ -1300,13 +1379,53 @@ local function onEditorGui()
     if imgui.Button(rtl("reload config") .. "##reload", imgui.ImVec2(BTN_W, 0)) then
       loadConfig()
       coverage = nil
-      statusText = cfgError and ("error: " .. cfgError) or "config loaded"
+      preview.loadStyles()
+      statusText = cfgError and tr("error: %s", tr(cfgError)) or "config loaded"
     end
+
+    imgui.Separator()
+    alignRight(BTN_W * 2 + 8)
+    if imgui.Button(rtl("render selection") .. "##pvrender", imgui.ImVec2(BTN_W, 0)) then
+      statusText = preview.renderSelection() or ""
+    end
+    imgui.SameLine()
+    if imgui.Button(rtl("clear preview") .. "##pvclear", imgui.ImVec2(BTN_W, 0)) then
+      preview.clearPreview()
+      statusText = "preview cleared"
+    end
+
+    alignRight(BTN_W)
+    if imgui.Button(rtl("mark as sidewalk") .. "##pvconv", imgui.ImVec2(BTN_W, 0)) then
+      statusText = preview.convertSelection() or ""
+    end
+
+    livePtr[0] = preview.isLive()
+    imgui.Checkbox(rtl("auto refresh") .. "##pvlive", livePtr)
+    if livePtr[0] ~= preview.isLive() then
+      preview.setLive(livePtr[0])
+      statusText = livePtr[0] and "auto refresh on" or "auto refresh off"
+    end
+
+    if preview.isLive() then
+      liveDelayPtr[0] = preview.getLiveDelay()
+      imgui.PushItemWidth(120)
+      imgui.DragFloat(rtl("delay (s)") .. "##pvdelay", liveDelayPtr,
+                      0.05, preview.liveMinDelay(), 10.0, "%.2f")
+      imgui.PopItemWidth()
+      if liveDelayPtr[0] ~= preview.getLiveDelay() then
+        preview.setLiveDelay(liveDelayPtr[0])
+      end
+      textv(tr("auto: %d of %d rendered",
+               preview.renderedCount(), preview.liveMaxRoads()),
+            imgui.ImVec4(0.4, 1, 0.4, 1))
+    end
+
+    text("preview only - it is not saved with the map.", imgui.ImVec4(0.5, 0.5, 0.5, 1))
 
     if not palette then
       if cfgMissing then
         text("no config in this level yet", imgui.ImVec4(0.8, 0.8, 0.8, 1))
-        text(cfgPath ~= "" and cfgPath or CONFIG_NAME, imgui.ImVec4(0.6, 0.6, 0.6, 1))
+        textv(cfgPath ~= "" and cfgPath or CONFIG_NAME, imgui.ImVec4(0.6, 0.6, 0.6, 1))
         text("create an empty one, then add materials under 'advanced'",
              imgui.ImVec4(0.6, 0.6, 0.6, 1))
         alignRight(BTN_W)
@@ -1315,8 +1434,8 @@ local function onEditorGui()
         end
         drawAdvanced()
       else
-        text("config not loaded: " .. tostring(cfgError), imgui.ImVec4(1, 0.45, 0.35, 1))
-        text(cfgPath ~= "" and cfgPath or CONFIG_NAME, imgui.ImVec4(0.6, 0.6, 0.6, 1))
+        textv(tr("config not loaded: %s", tr(tostring(cfgError))), imgui.ImVec4(1, 0.45, 0.35, 1))
+        textv(cfgPath ~= "" and cfgPath or CONFIG_NAME, imgui.ImVec4(0.6, 0.6, 0.6, 1))
         text("fix or delete the file - nothing is written while it is unreadable",
              imgui.ImVec4(0.6, 0.6, 0.6, 1))
       end
@@ -1338,14 +1457,18 @@ local function onEditorGui()
       if not hasSelection then
         text("select decals in the SceneTree", imgui.ImVec4(1, 0.5, 0, 1))
       else
-        text(string.format("selected: %d  (DecalRoad: %d, MeshRoad: %d)",
-                           #ids, decalCount, meshCount))
+        textv(tr("selected: %d  (DecalRoad: %d, MeshRoad: %d)",
+                 #ids, decalCount, meshCount))
         if decalCount + meshCount < #ids then
           text("the selection contains objects that are neither DecalRoad nor MeshRoad",
                imgui.ImVec4(1, 0.7, 0.2, 1))
         end
       end
 
+      imgui.Separator()
+      drawCoverage()
+
+      imgui.Separator()
       for _, ax in ipairs(AXES) do
         drawAxis(ax, ids, hasSelection)
       end
@@ -1361,9 +1484,6 @@ local function onEditorGui()
       end
 
       imgui.Separator()
-      drawCoverage()
-
-      imgui.Separator()
       drawAdvanced()
 
       if statusText ~= "" then
@@ -1376,15 +1496,11 @@ local function onEditorGui()
   sectionForce = nil
 end
 
--- ---------------------------------------------------------------------------
--- setup
--- ---------------------------------------------------------------------------
-
 ensureRegistered = function()
   if registered then return end
   if not editor or not editor.registerWindow then return end
   editor.registerWindow(toolWindowName, imgui.ImVec2(380, 560))
-  editor.addWindowMenuItem("Sidewalk Tags", function()
+  editor.addWindowMenuItem(rtl("Sidewalk Tags"), function()
     editor.showWindow(toolWindowName)
   end, {groupMenuName = "PIT"})
   registered = true
@@ -1408,6 +1524,7 @@ local function open()
   editor.showWindow(toolWindowName)
 end
 
+M.onEditorInspectorFieldChanged = preview.onEditorInspectorFieldChanged
 M.onEditorGui = onEditorGui
 M.onEditorInitialized = onEditorInitialized
 M.onEditorAfterOpenLevel = onEditorAfterOpenLevel
